@@ -1,0 +1,39 @@
+#!/bin/sh
+# Задача cron: keeper-job <container> <job>. Действие берётся из меток контейнера
+# в момент запуска: keeper.cron.<job>.action (restart|start|stop|exec, по умолчанию restart)
+# и keeper.cron.<job>.command (для exec, выполняется через sh -c внутри контейнера
+# от пользователя keeper.cron.<job>.user, если задан).
+set -u
+name="$1"
+job="$2"
+
+log() { echo "$(date '+%F %T') [keeper] cron $name/$job: $*"; }
+label() { docker inspect -f "{{index .Config.Labels \"keeper.cron.${job}.$1\"}}" "$name" 2>/dev/null; }
+
+action=$(label action)
+action="${action:-restart}"
+
+case "$action" in
+  restart)
+    log "restart"
+    t="${KEEPER_STOP_TIMEOUT:-30}"
+    timeout $((t + ${KEEPER_CMD_TIMEOUT:-180})) docker restart -t "$t" "$name" >/dev/null ;;
+  start)
+    [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ] && exit 0
+    log "start"
+    timeout "${KEEPER_CMD_TIMEOUT:-180}" docker start "$name" >/dev/null ;;
+  stop)
+    log "stop"
+    docker stop -t "${KEEPER_STOP_TIMEOUT:-30}" "$name" >/dev/null ;;
+  exec)
+    command=$(label command)
+    [ -n "$command" ] || { log "no keeper.cron.${job}.command"; exit 1; }
+    user=$(label user)
+    log "exec${user:+ as $user}: $command"
+    docker exec ${user:+-u "$user"} "$name" sh -c "$command" ;;
+  *)
+    log "unknown action '$action'"; exit 1 ;;
+esac
+rc=$?
+[ "$rc" -eq 0 ] || log "failed (exit $rc)"
+exit "$rc"
