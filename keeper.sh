@@ -4,7 +4,9 @@
 #   autostart — запускает контейнеры, которые не смогли стартовать (State.Error не пустой:
 #               например, cifs/nfs volume не смонтировался, потому что NAS недоступен).
 #               Остановленные вручную (docker stop / compose stop) не трогает: у них State.Error пустой;
-#   cron      — выполняет задачи из меток keeper.cron.<job>.* (restart/start/stop/exec по расписанию).
+#   cron      — выполняет задачи из меток keeper.cron.<job>.* (restart/start/stop/exec по расписанию);
+#   autoremove — удаляет одноразовые контейнеры с меткой keeper.autoremove=true, успешно
+#               завершившиеся (код 0) не меньше KEEPER_AUTOREMOVE_DELAY секунд назад.
 # Подробности и метки — в README.md.
 set -u
 
@@ -16,6 +18,8 @@ KEEPER_CMD_TIMEOUT="${KEEPER_CMD_TIMEOUT:-180}"     # предел для одн
 KEEPER_AUTOHEAL="${KEEPER_AUTOHEAL:-true}"
 KEEPER_AUTOSTART="${KEEPER_AUTOSTART:-true}"
 KEEPER_CRON="${KEEPER_CRON:-true}"
+KEEPER_AUTOREMOVE="${KEEPER_AUTOREMOVE:-true}"
+KEEPER_AUTOREMOVE_DELAY="${KEEPER_AUTOREMOVE_DELAY:-300}"  # секунд после завершения до удаления
 export KEEPER_STOP_TIMEOUT KEEPER_CMD_TIMEOUT
 
 CRON_DIR=/var/spool/cron/crontabs
@@ -63,6 +67,22 @@ autostart() {
   done
 }
 
+# Удаляет одноразовые контейнеры (keeper.autoremove=true), которые завершились с кодом 0.
+# Задержка нужна, чтобы docker compose успел увидеть завершение (depends_on:
+# service_completed_successfully). Упавшие контейнеры остаются, чтобы можно было посмотреть логи.
+autoremove() {
+  now=$(date +%s)
+  for id in $(docker ps -aq --filter label=keeper.autoremove=true --filter status=exited); do
+    info=$(docker inspect -f '{{.State.ExitCode}} {{.State.FinishedAt}}' "$id" 2>/dev/null) || continue
+    [ "${info%% *}" = 0 ] || continue
+    fin="${info#* }"; fin="${fin%Z}"; fin="${fin%%.*}"
+    fin_s=$(date -u -D '%Y-%m-%dT%H:%M:%S' -d "$fin" +%s 2>/dev/null) || continue
+    [ $((now - fin_s)) -ge "$KEEPER_AUTOREMOVE_DELAY" ] || continue
+    log "autoremove: removing $(name_of "$id") (exited 0 at $fin UTC)"
+    run 60 rm "$id"
+  done
+}
+
 # Собирает crontab из меток keeper.cron.<job>.schedule всех контейнеров (и остановленных)
 # и отдаёт его crond, если он изменился. Сама задача (keeper-job) читает остальные метки
 # в момент запуска, поэтому в crontab попадают только имя контейнера и задачи.
@@ -92,7 +112,7 @@ sync_cron() {
 
 trap 'log "stopping"; [ -n "${crond_pid:-}" ] && kill "$crond_pid" 2>/dev/null; exit 0' TERM INT
 
-log "starting: label=${KEEPER_LABEL} interval=${KEEPER_INTERVAL}s autoheal=${KEEPER_AUTOHEAL} autostart=${KEEPER_AUTOSTART} cron=${KEEPER_CRON}"
+log "starting: label=${KEEPER_LABEL} interval=${KEEPER_INTERVAL}s autoheal=${KEEPER_AUTOHEAL} autostart=${KEEPER_AUTOSTART} cron=${KEEPER_CRON} autoremove=${KEEPER_AUTOREMOVE}"
 docker version -f 'docker {{.Server.Version}}' || { log "no access to docker socket"; exit 1; }
 
 crond_pid=
@@ -113,6 +133,7 @@ while :; do
   if [ $(( $(date +%s) - started )) -ge "$KEEPER_START_PERIOD" ]; then
     [ "$KEEPER_AUTOHEAL" = true ] && autoheal
     [ "$KEEPER_AUTOSTART" = true ] && autostart
+    [ "$KEEPER_AUTOREMOVE" = true ] && autoremove
   fi
   if [ -n "$crond_pid" ] && ! kill -0 "$crond_pid" 2>/dev/null; then
     log "crond died, exiting"

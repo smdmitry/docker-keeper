@@ -4,6 +4,7 @@
 
 - **autoheal**: перезапускает запущенные контейнеры в статусе `unhealthy`. Заменяет `willfarrell/autoheal` и использует ту же метку `autoheal=true`.
 - **autostart**: запускает контейнеры, которые не смогли стартовать. Например, при загрузке хоста NAS был недоступен и cifs/nfs volume не смонтировался, или после перезапуска через autoheal монтирование упало. Docker сам такие старты не повторяет, даже с `restart: unless-stopped`. Контейнеры, остановленные вручную (`docker stop`, `docker compose stop`), не трогаются: keeper запускает только те, у которых заполнен `State.Error`, то есть последний запуск завершился ошибкой.
+- **autoremove**: удаляет одноразовые контейнеры с меткой `keeper.autoremove=true` (init-скрипты и т. п.), если они завершились с кодом 0 больше `KEEPER_AUTOREMOVE_DELAY` секунд назад. Упавшие остаются, чтобы можно было посмотреть логи.
 - **cron**: выполняет задачи по расписанию, которое задаётся метками на самих контейнерах: перезапустить, запустить, остановить или выполнить команду внутри.
 
 Основан на образе `docker:cli`: shell-скрипты и `crond` из busybox, без зависимостей.
@@ -40,6 +41,8 @@ services:
 | `KEEPER_AUTOHEAL` | `true` | включить autoheal |
 | `KEEPER_AUTOSTART` | `true` | включить autostart |
 | `KEEPER_CRON` | `true` | включить cron |
+| `KEEPER_AUTOREMOVE` | `true` | включить autoremove |
+| `KEEPER_AUTOREMOVE_DELAY` | `300` | секунд после успешного завершения до удаления контейнера |
 | `TZ` | UTC | часовой пояс для расписаний cron |
 
 ## Метки контейнеров
@@ -59,6 +62,22 @@ services:
 ```
 
 Пример с NAS: volume cifs/nfs и healthcheck, который проверяет, что шара не пустая. Если NAS пропадёт, контейнер станет unhealthy, autoheal его перезапустит, монтирование при старте упадёт, и autostart будет пробовать запускать контейнер каждые `KEEPER_INTERVAL` секунд, пока NAS не вернётся. Без смонтированной шары контейнер не работает.
+
+### autoremove
+
+```yaml
+  frigate-faces-init:
+    restart: "no"
+    labels:
+      keeper.autoremove: "true"
+
+  frigate:
+    depends_on:
+      frigate-faces-init:
+        condition: service_completed_successfully
+```
+
+Задержка `KEEPER_AUTOREMOVE_DELAY` нужна, чтобы `docker compose up` успел дождаться завершения init-контейнера и запустить зависимые. При следующем `docker compose up` удалённый контейнер создаётся и выполняется заново, поэтому скрипт должен спокойно переносить повторный запуск. Не ставь эту метку на контейнеры, которые перезапускаются по cron (`keeper.cron.*`): после удаления перезапускать будет нечего.
 
 ### cron
 
